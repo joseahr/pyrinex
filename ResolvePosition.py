@@ -8,7 +8,7 @@ from Utils import Utils
 from math import sqrt, sin, atan2, cos, pi, atan,acos, tan
 from Geometrias.Punto3D import Punto3D
 from Proyecciones.Cargeo2Geo import Cargeo2Geo
-from numpy import exp
+from numpy import exp, matrix, linalg, diag
 
 class Solver(object) :
 
@@ -20,6 +20,7 @@ class Solver(object) :
         self.observation = obsParser
 
         self.epocas = []
+        self.ecuaciones = {}
 
         ## Velocidad de la luz
         self.C = 2.99792458e8
@@ -49,13 +50,15 @@ class Solver(object) :
         for obs in self.observation.getObservations():
             ## De la observación de una época
             ## Para cada satélite
+            if obs['OK_FLAG'] != 0: continue
+            ## Tobservación
+            tobs = obs['EPOCA']
+            epocObj = {'EPOCA': tobs, 'OBSERVACIONES' : {} }
             for sat in obs['OBSERVACIONES'].keys():
                 ## Si el satélite es GPS
                 if 'G' in sat :
                     ## Cogemos los observables del satélite
                     observation = obs['OBSERVACIONES'][sat]
-                    ## Tobservación
-                    tobs = obs['EPOCA']
                     ## Efeméride más próxima a nuestra época
                     efem = self.navigation.getParams(tobs, sat)
 
@@ -63,7 +66,6 @@ class Solver(object) :
                     ## IMPORTANTE!! Si no hay P2 no podemos
                     ## calcular NADA!!
                     if not efem or not 'P2' in observation: continue
-                    if obs['OK_FLAG'] != 0: continue
 
                     ## TOE
                     toe = efem['toe']
@@ -155,16 +157,13 @@ class Solver(object) :
                     ## Finalmente el tiempo corregido será :
                     tcorr += trel - ttgd_l2
                     ## Generamos un diccionario con los datos necesarios de la observación
-                    epocObj = {
+                    epocObj['OBSERVACIONES'].update({sat : {
                           'ECEF' : [Xsat, Ysat, Zsat]
                         , 'TCORR': tcorr
-                        , 'EPOCA': tobs
-                        , 'SAT'  : sat
-                        , 'OBSERVATION' : obs['OBSERVACIONES'][sat]
-                    }
-                    ## Lo añadimos a la lista de épocas
-                    self.epocas.append(epocObj)
-
+                        ##, 'EPOCA': tobs
+                        ##, 'SAT'  : sat
+                        , 'OBSERVACION' : obs['OBSERVACIONES'][sat]
+                    }})
                     '''
                     printSats = ['G02', 'G04', 'G23']
                     if sat in printSats and Utils.UTC2GPS(obs['EPOCA']) == 135110 :
@@ -193,27 +192,33 @@ class Solver(object) :
                         print ('tcorr', tcorr)
                         print ('\n')
                     '''
+            ## Lo añadimos a la lista de épocas
+            self.epocas.append(epocObj)
 
     def __calcReceptorPositions(self):
         w = 7.2921151467e-5
         ## Coordenadas aproximadas del observador
         apx_pos = self.observation.getHeader()['APX_COORDS']
         cont = 0 ## Borrar luego
-        ## Recorremos las observaciones
+        ## Recorremos las épocas
         for epoc in self.epocas :
-            ## Satélite observado
-            sat = epoc['SAT']
-            ## Coordenadas ECEF del satélite
-            Xsat, Ysat, Zsat = epoc['ECEF']
             ## Coordenadas aproximadas del observador que se actualizarán
             Xest, Yest, Zest = apx_pos
             ## Hora de la observación
             tobs = epoc['EPOCA']
+            #print(tobs, sat)
             ## Hora de la observación en segundos GPS
             tsec_week = Utils.UTC2GPS(tobs)
-            ## Borrar luego
-            ##pres = temp = H = e_wp = e_semicirculos = b = dtropo = psi = lon_semicirculos = lat_semicirculos = lat_geomagnetica = tsec_week = tiempo_local = 0
-            for i in range(0,1):
+
+            corr_reloj = 0
+            A = []
+            K = []
+            P = []
+            cont += 1
+            ## Recorremos las observaciones a cada satélite
+            for sat in epoc['OBSERVACIONES'].keys():
+                ## Coordenadas ECEF del satélite
+                Xsat, Ysat, Zsat = epoc['OBSERVACIONES'][sat]['ECEF']
                 ## TravelTime
                 traveltime = sqrt( (Xsat - Xest)**2 + (Ysat - Yest)**2 + (Zsat - Zest)**2 ) / self.C
                 ## OmegaTau
@@ -297,7 +302,17 @@ class Solver(object) :
                 ## Cálculo del retraso ionosférico para la frecuencia L2 (en metros)
                 Il2 = 1.65 * Il1m
 
-                if sat == 'G02' and cont < 10:
+                dist = sqrt( (Xsat-Xest)**2 + (Ysat-Yest)**2 + (Zsat-Zest)**2 )
+                p2   = epoc['OBSERVACIONES'][sat]['OBSERVACION']['P2']['VALUE']
+                tcorr= epoc['OBSERVACIONES'][sat]['TCORR']
+                A.append([-(Xsat-Xest)/dist, -(Ysat-Yest)/dist, -(Zsat-Zest)/dist, 1])
+                K.append([p2 - dist - corr_reloj + (self.C*tcorr) - dtropo - Il2])
+                P.append(sin(ele)**2/(1.5*0.3)**2)
+                matrizA = matrix(A)
+                matrizK = matrix(K)
+                matrizP = matrix(diag(P))
+
+                if sat == 'G04' and cont < 2:
                     print (traveltime)
                     print (wt)
                     print (Xsat, Ysat, Zsat)
@@ -309,10 +324,13 @@ class Solver(object) :
                     print('lon_i', lon_i, 'lat_i', lat_i)
                     print('lat_geomag', lat_geomagnetica)
                     print('tsec', tsec_week)
-                    print('timepo', tiempo_local)
-                    print('Ai', Ai, 'Il1', Il1m, 'Il2', Il2)
+                    print('tiempo_local', tiempo_local)
+                    print('Ai', Ai, 'Pi', Pi, 'Il1', Il1m, 'Il2', Il2)
                     print('-----------------')
-            cont += 1
+            ## Calculamos la solución
+            print(Xest, Yest, Zest)
+            print(linalg.inv(matrizA.transpose() * matrizP * matrizA) * (matrizA.transpose() * matrizP * matrizK))
+
 
 ## Función principal para probar la clase
 def main():
